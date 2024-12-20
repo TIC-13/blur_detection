@@ -1,0 +1,6 @@
+Acurácia: 0.94
+Precisão: 0.89
+Recall: 1.00
+F1-Score: 0.94
+Quantidade de imagens classificadas como "sharp": 56
+Quantidade de imagens classificadas como "blurred": 44
