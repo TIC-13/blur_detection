@@ -10,6 +10,8 @@ from torchvision import transforms
 import pyiqa as iqa
 import time
 import pandas as pd
+import argparse
+import multiprocessing
 
 # Aplica o modelo e verifica a confiança dos resultados
 def apply_model_and_check_confidence(image_path, interpreter):
@@ -81,57 +83,177 @@ def evaluate_image(image_path, interpreter, ilniqe_model, device):
     
     return final_classification, confidence, ilniqe_score, fft_score
 
-def main():
-    image_directory = 'images' # Atenção: aqui, coloque o caminho para o diretório com as imagens
-    output_csv_path = 'imagens_anotadas/testes/resultados_3_juizes_imagens_anotadas.csv'
-    output_txt_path = 'imagens_anotadas/testes/resultados_3_juizes_imagens_anotadas.txt'
+def get_arguments():    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--image_directory', type=str, default='../../Data/HAM10000/images')
+    parser.add_argument('--output_csv_path', type=str, default='')
+    parser.add_argument('--output_txt_path', type=str, default='')
+    parser.add_argument('--model_path', type=str, default='../blur.tflite')
+    parser.add_argument('--log', action='store_true', default=False, help="if true, save a log file")
+    parser.add_argument('--verbose', action='store_true', default=False, help="if true, prints info for each image")
+    parser.add_argument('--num_processes', type=int, default=1, help="Number of processes to run in parallel")
+    parser.add_argument('--device', type= str, choices= ["cpu", "cuda"], default="cpu")
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    ilniqe_model = iqa.create_metric('ilniqe', device=device)
+    args = parser.parse_args()
+    return args
+
+def get_all_images(image_directory):
+    all_images = sorted(os.listdir(image_directory))
     
-    interpreter = tf.lite.Interpreter(model_path='blur.tflite') # Atenção: aqui, coloque o caminho pro modelo tflite
-    interpreter.allocate_tensors()
+    # Filter out files that don't look like images if you want, 
+    # or just let judge(...) skip them. 
+    # For safety, we do minimal filtering here (optional).
+    valid_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff')
+    all_images = [img for img in all_images if img.lower().endswith(valid_extensions)]
+    return all_images
+
+def judge(proc_id, interpreter, ilniqe_model, device, args, image_list):
     
     start_time = time.time()
     results = []
-    
-    with open(output_txt_path, 'w') as txt_file:
-        for image_name in os.listdir(image_directory):
-            image_path = os.path.join(image_directory, image_name)
+    with open(args.output_txt_path, 'w') as txt_file:
+        total_images = len(image_list)
+        p = 10
+        for img_index, image_name in enumerate(image_list):
+            pctg = round(100*img_index/total_images)
+            if pctg > p:
+                print(f"process {proc_id}: {pctg}% done")
+                p += 10
+
+            image_path = os.path.join(args.image_directory, image_name)
             
             if not image_name.lower().endswith(('png', 'jpg', 'jpeg', 'bmp', 'tiff')):
                 continue
             
             if not os.path.exists(image_path):
-                print(f"Imagem não encontrada: {image_path}")
-                txt_file.write(f"Imagem não encontrada: {image_path}\n")
+                if args.verbose: print(f"Imagem não encontrada: {image_path}")
+                if args.log: txt_file.write(f"Imagem não encontrada: {image_path}\n")
                 continue
             
             final_result, confidence, ilniqe_score, fft_score = evaluate_image(image_path, interpreter, ilniqe_model, device)
             results.append([image_name, final_result, confidence, ilniqe_score, fft_score])
             
-            print(f"Imagem: {image_name}")
-            print(f"Confiança do modelo: {confidence:.2f}")
-            txt_file.write(f"Imagem: {image_name}\n")
-            txt_file.write(f"Confiança do modelo: {confidence:.2f}\n")
+            if args.verbose: print(f"Imagem: {image_name}")
+            if args.verbose: print(f"Confiança do modelo: {confidence:.2f}")
+            if args.log: txt_file.write(f"Imagem: {image_name}\n")
+            if args.log: txt_file.write(f"Confiança do modelo: {confidence:.2f}\n")
             if ilniqe_score is not None:
-                print(f"ILNIQE Score: {ilniqe_score:.2f}")
-                txt_file.write(f"ILNIQE Score: {ilniqe_score:.2f}\n")
+                if args.verbose: print(f"ILNIQE Score: {ilniqe_score:.2f}")
+                if args.log: txt_file.write(f"ILNIQE Score: {ilniqe_score:.2f}\n")
             if fft_score is not None:
-                print(f"FFT Score: {fft_score:.2f}")
-                txt_file.write(f"FFT Score: {fft_score:.2f}\n")
-            print(f"A imagem foi classificada como: {final_result}")
-            txt_file.write(f"A imagem foi classificada como: {final_result}\n")
-            print("-" * 50)
-            txt_file.write("-" * 50 + "\n")
+                if args.verbose: print(f"FFT Score: {fft_score:.2f}")
+                if args.log: txt_file.write(f"FFT Score: {fft_score:.2f}\n")
+            if args.verbose: print(f"A imagem foi classificada como: {final_result}")
+            if args.log: txt_file.write(f"A imagem foi classificada como: {final_result}\n")
+            if args.verbose: print("-" * 50)
+            if args.log: txt_file.write("-" * 50 + "\n")
+        
+        execution_time = time.time() - start_time
+
+        if args.verbose: print(f"Tempo de execução total: {execution_time} segundos")
+        if args.log: txt_file.write(f"Tempo de execucao total: {execution_time} segundos\n")
+
+    return results
+
+def worker_judge(proc_id, image_list, args, return_dict):
+    """
+    Each process will re-initialize the TFLite interpreter and ILNIQE model,
+    then call judge(...) on its sub-list of images.
+    The results get stored in return_dict[proc_id].
+    """
+    # Re-initialize model and interpreter inside the child process
+    device = args.device
+    ilniqe_model = iqa.create_metric('ilniqe', device=device)
     
-    results_df = pd.DataFrame(results, columns=['IMG_FILE', 'FINAL_RESULT', 'CONFIDENCE', 'ILNIQE_SCORE', 'FFT_SCORE'])
-    results_df.to_csv(output_csv_path, index=False)
+    interpreter = tf.lite.Interpreter(model_path=args.model_path)
+    interpreter.allocate_tensors()
     
-    execution_time = time.time() - start_time
-    print(f"Tempo de execução total: {execution_time} segundos")
-    with open(output_txt_path, 'a') as txt_file:
-        txt_file.write(f"Tempo de execução total: {execution_time} segundos\n")
+    results = judge(proc_id, interpreter, ilniqe_model, device, args, image_list)
+    return_dict[proc_id] = results  # Store results in a shared dict keyed by process ID
+
+
+def parallel_judge(args):
+    """
+    This function divides all images into chunks, spawns multiple processes,
+    and merges the results from each process.
+    """
+    all_images = get_all_images(args.image_directory)
+    total_images = len(all_images)
+
+    if total_images == 0:
+        print("No images found in the directory.")
+        return []
+    
+    num_processes = args.num_processes if args.num_processes > 0 else 1
+    
+    # Decide how many images per process
+    chunk_size = total_images // num_processes
+    print("chunk_size:", chunk_size)
+    manager = multiprocessing.Manager()
+    return_dict = manager.dict()
+
+    processes = []
+    # Launch each process with its sub-list
+    for proc_id in range(num_processes):
+        start_idx = proc_id * chunk_size
+        if proc_id == num_processes-1:
+            end_idx = total_images
+        else:
+            end_idx = min((proc_id + 1) * chunk_size, total_images)
+        
+        if start_idx >= end_idx:
+            break  # No more images
+        
+        chunk_list = all_images[start_idx:end_idx]
+        
+        p = multiprocessing.Process(
+            target=worker_judge,
+            args=(proc_id, chunk_list, args, return_dict)
+        )
+        p.start()
+        processes.append(p)
+    
+    # Wait for all processes to finish
+    for p in processes:
+        p.join()
+    
+     # Combine all partial results
+    combined_results = []
+    for proc_id in sorted(return_dict.keys()):
+        combined_results.extend(return_dict[proc_id])
+    
+    return combined_results
+
+def main():    
+    args= get_arguments()
+    
+    if not args.output_csv_path:
+        args.output_csv_path = os.path.join(os.path.dirname(args.image_directory),"resultados_3_juizes_imagens_anotadas.csv")
+    if not args.output_txt_path:
+        args.output_txt_path = os.path.join(os.path.dirname(args.image_directory),"resultados_3_juizes_imagens_anotadas.txt")
+
+    # If only 1 process was asked, run single-process approach directly
+    # Otherwise, run in parallel and merge results
+    if args.num_processes == 1:
+        device = args.device
+        ilniqe_model = iqa.create_metric('ilniqe', device=device)
+        
+        interpreter = tf.lite.Interpreter(model_path=args.model_path)
+        interpreter.allocate_tensors()
+        
+        all_images = get_all_images(args.image_directory)
+        results = judge(0, interpreter, ilniqe_model, device, args, all_images,)
+    else:
+        results = parallel_judge(args)
+    
+    # Save results to CSV
+    if results:
+        results_df = pd.DataFrame(results, columns=['IMG_FILE', 'FINAL_RESULT', 'CONFIDENCE', 'ILNIQE_SCORE', 'FFT_SCORE'])
+        results_df.to_csv(args.output_csv_path, index=False)
+        print(f"Results saved to {args.output_csv_path}")
+    else:
+        print("No results to save. Check your directory.")
+    
 
 if __name__ == "__main__":
     main()
